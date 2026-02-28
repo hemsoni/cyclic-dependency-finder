@@ -1,20 +1,102 @@
 """
 Cyclic Dependency Finder
 ========================
-Reads an Excel file (all sheets, all columns) and detects circular dependencies.
+Reads an Excel file (all sheets) and detects circular dependencies.
 
 Usage:
-    python find_cycles.py <excel_file> --source <column> --target <column>
-
-Example:
-    python find_cycles.py dependencies.xlsx --source "Task" --target "Depends On"
+    python find_cycles.py myfile.xlsx
 """
 
-import argparse
 import sys
 from collections import defaultdict
 
 import openpyxl
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompts
+# ---------------------------------------------------------------------------
+
+def ask_choice(prompt, options):
+    """Show a numbered menu and return the user's choice."""
+    print()
+    print(prompt)
+    for i, option in enumerate(options, 1):
+        print(f"  {i}. {option}")
+
+    while True:
+        try:
+            choice = int(input(f"Enter number (1-{len(options)}): "))
+            if 1 <= choice <= len(options):
+                return options[choice - 1]
+        except (ValueError, EOFError):
+            pass
+        print(f"  Please enter a number between 1 and {len(options)}.")
+
+
+def collect_columns(workbook):
+    """
+    Scan all sheets, gather every unique column name, and let the user
+    pick the source and target columns interactively.
+    """
+    all_columns = []
+    for sheet_name in workbook.sheetnames:
+        sheet = workbook[sheet_name]
+        header_row = next(sheet.iter_rows(min_row=1, max_row=1), None)
+        if header_row is None:
+            continue
+        for cell in header_row:
+            if cell.value is not None:
+                name = str(cell.value).strip()
+                if name and name not in all_columns:
+                    all_columns.append(name)
+
+    if len(all_columns) < 2:
+        print("ERROR: The Excel file must have at least 2 columns.")
+        sys.exit(1)
+
+    print()
+    print("=" * 60)
+    print("  Columns found in your Excel file:")
+    print("=" * 60)
+    for i, col in enumerate(all_columns, 1):
+        print(f"  {i}. {col}")
+
+    source_col = ask_choice(
+        "Which column contains the ITEM NAME (e.g. Task, Module)?",
+        all_columns,
+    )
+
+    remaining = [c for c in all_columns if c != source_col]
+    target_col = ask_choice(
+        "Which column contains the DEPENDENCY (e.g. Depends On, Requires)?",
+        remaining,
+    )
+
+    return source_col, target_col
+
+
+def ask_separator():
+    """Ask how multiple dependencies are separated in a single cell."""
+    print()
+    print("If one cell can list multiple dependencies, how are they separated?")
+    print("  1. Comma        (e.g. Task A, Task B)")
+    print("  2. Semicolon    (e.g. Task A; Task B)")
+    print("  3. Pipe         (e.g. Task A | Task B)")
+    print("  4. New line     (e.g. each on its own line inside the cell)")
+    print("  5. Only one dependency per cell (no separator needed)")
+
+    while True:
+        try:
+            choice = int(input("Enter number (1-5): "))
+            if choice in (1, 2, 3, 4, 5):
+                break
+        except (ValueError, EOFError):
+            pass
+        print("  Please enter a number between 1 and 5.")
+
+    mapping = {1: ",", 2: ";", 3: "|", 4: "\n", 5: None}
+    return mapping[choice]
 
 
 # ---------------------------------------------------------------------------
@@ -29,13 +111,6 @@ def build_graph(workbook, source_col, target_col, separator):
 
     If a target cell contains multiple values separated by `separator`,
     each value becomes a separate edge.
-
-    Returns
-    -------
-    graph : dict[str, set[str]]
-        Adjacency list  {node: {neighbours ...}}
-    edge_origins : dict[tuple, list[str]]
-        Maps (source, target) to the sheet(s) where that edge was found.
     """
     graph = defaultdict(set)
     edge_origins = defaultdict(list)
@@ -43,19 +118,16 @@ def build_graph(workbook, source_col, target_col, separator):
     for sheet_name in workbook.sheetnames:
         sheet = workbook[sheet_name]
 
-        # Read the header row to find column positions
         headers = [
             str(cell.value).strip() if cell.value is not None else ""
             for cell in next(sheet.iter_rows(min_row=1, max_row=1))
         ]
 
-        # Case-insensitive lookup
         headers_lower = [h.lower() for h in headers]
         src_lower = source_col.lower()
         tgt_lower = target_col.lower()
 
         if src_lower not in headers_lower or tgt_lower not in headers_lower:
-            # This sheet doesn't have the required columns -- skip it
             continue
 
         src_idx = headers_lower.index(src_lower)
@@ -73,13 +145,14 @@ def build_graph(workbook, source_col, target_col, separator):
             if not raw_targets:
                 continue
 
-            targets = [t.strip() for t in raw_targets.split(separator) if t.strip()]
+            if separator:
+                targets = [t.strip() for t in raw_targets.split(separator) if t.strip()]
+            else:
+                targets = [raw_targets]
 
             for target_val in targets:
                 graph[source_val].add(target_val)
                 edge_origins[(source_val, target_val)].append(sheet_name)
-                # Make sure target nodes exist in the graph even if they have
-                # no outgoing edges, so the cycle detection visits them.
                 if target_val not in graph:
                     graph[target_val] = set()
 
@@ -87,13 +160,7 @@ def build_graph(workbook, source_col, target_col, separator):
 
 
 def find_all_cycles(graph):
-    """
-    Find ALL elementary cycles in a directed graph using Johnson's approach
-    (simplified DFS-based).
-
-    Returns a list of cycles, where each cycle is a list of node names.
-    Example: ["A", "B", "C"] means A -> B -> C -> A
-    """
+    """Find all cycles in a directed graph using DFS."""
     WHITE, GRAY, BLACK = 0, 1, 2
     cycles = []
 
@@ -104,10 +171,8 @@ def find_all_cycles(graph):
 
         for neighbour in graph.get(node, []):
             if color[neighbour] == GRAY and neighbour in path_set:
-                # Found a cycle -- extract it
                 cycle_start = path.index(neighbour)
-                cycle = path[cycle_start:]
-                cycles.append(cycle)
+                cycles.append(path[cycle_start:])
             elif color[neighbour] == WHITE:
                 dfs(neighbour, color, path, path_set)
 
@@ -128,7 +193,6 @@ def deduplicate_cycles(cycles):
     seen = set()
     unique = []
     for cycle in cycles:
-        # Normalize: rotate so the smallest element is first
         min_idx = cycle.index(min(cycle))
         rotated = tuple(cycle[min_idx:] + cycle[:min_idx])
         if rotated not in seen:
@@ -138,7 +202,7 @@ def deduplicate_cycles(cycles):
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
+# Display
 # ---------------------------------------------------------------------------
 
 def print_cycles(cycles, edge_origins):
@@ -157,7 +221,6 @@ def print_cycles(cycles, edge_origins):
         chain = " -> ".join(cycle) + " -> " + cycle[0]
         print(f"  Cycle {i}:  {chain}")
 
-        # Show which sheet each edge came from
         for j in range(len(cycle)):
             src = cycle[j]
             tgt = cycle[(j + 1) % len(cycle)]
@@ -170,69 +233,63 @@ def print_summary(workbook, graph, source_col, target_col):
     """Print a summary of what was read."""
     print()
     print("=" * 60)
-    print("  Cyclic Dependency Finder")
+    print("  Cyclic Dependency Finder - Summary")
     print("=" * 60)
     print(f"  Sheets scanned  : {len(workbook.sheetnames)}")
     print(f"  Source column    : {source_col}")
     print(f"  Target column    : {target_col}")
-    print(f"  Unique nodes     : {len(graph)}")
+    print(f"  Unique items     : {len(graph)}")
     total_edges = sum(len(v) for v in graph.values())
-    print(f"  Total edges      : {total_edges}")
+    print(f"  Total links      : {total_edges}")
     print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Find cyclic (circular) dependencies in an Excel file.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python find_cycles.py tasks.xlsx --source "Task" --target "Depends On"
-  python find_cycles.py modules.xlsx --source "Module" --target "Requires" --separator ";"
-        """,
-    )
-    parser.add_argument("excel_file", help="Path to the Excel file (.xlsx)")
-    parser.add_argument(
-        "--source",
-        required=True,
-        help='Column name that contains the item name (e.g. "Task")',
-    )
-    parser.add_argument(
-        "--target",
-        required=True,
-        help='Column name that contains the dependency (e.g. "Depends On")',
-    )
-    parser.add_argument(
-        "--separator",
-        default=",",
-        help='Separator when one cell lists multiple dependencies (default: ",")',
-    )
+    # --- Get Excel file path ---
+    if len(sys.argv) >= 2:
+        excel_path = sys.argv[1]
+    else:
+        print()
+        print("=" * 60)
+        print("  Cyclic Dependency Finder")
+        print("=" * 60)
+        excel_path = input("Enter the path to your Excel file (.xlsx): ").strip()
+        # Remove surrounding quotes if user copy-pasted a path with quotes
+        excel_path = excel_path.strip('"').strip("'")
 
-    args = parser.parse_args()
+    if not excel_path:
+        print("ERROR: No file path provided.")
+        sys.exit(1)
 
     # --- Load workbook ---
     try:
-        wb = openpyxl.load_workbook(args.excel_file, read_only=True, data_only=True)
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
     except FileNotFoundError:
-        print(f"ERROR: File not found: {args.excel_file}")
+        print(f"ERROR: File not found: {excel_path}")
         sys.exit(1)
     except Exception as e:
         print(f"ERROR: Could not open Excel file: {e}")
         sys.exit(1)
 
+    print(f"\n  Loaded: {excel_path}")
+    print(f"  Sheets: {', '.join(wb.sheetnames)}")
+
+    # --- Interactive column selection ---
+    source_col, target_col = collect_columns(wb)
+    separator = ask_separator()
+
     # --- Build graph ---
-    graph, edge_origins = build_graph(wb, args.source, args.target, args.separator)
+    graph, edge_origins = build_graph(wb, source_col, target_col, separator)
 
     if not graph:
-        print(f"ERROR: No data found. Check that columns '{args.source}' and "
-              f"'{args.target}' exist in at least one sheet.")
+        print(f"\nERROR: No data found with columns '{source_col}' and '{target_col}'.")
         sys.exit(1)
 
-    print_summary(wb, graph, args.source, args.target)
+    print_summary(wb, graph, source_col, target_col)
 
     # --- Detect cycles ---
     raw_cycles = find_all_cycles(graph)
@@ -242,8 +299,8 @@ Examples:
 
     wb.close()
 
-    # Exit code: 1 if cycles found, 0 if clean
-    sys.exit(1 if cycles else 0)
+    # Pause so the window stays open if user double-clicked the script
+    input("Press Enter to exit...")
 
 
 if __name__ == "__main__":
